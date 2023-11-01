@@ -87,20 +87,22 @@ let phi p =
 
 let ( +> ) f g x = g (f x)
 
-let map_fst f (x, y) = f x, y
-
-let effects p =
+let effects p deadcode_sentinal =
   if Config.Flag.effects ()
   then (
     if debug () then Format.eprintf "Effects...@.";
-    p |> Deadcode.f +> Effects.f +> map_fst Lambda_lifting.f)
+    let p, variable_uses = Deadcode.f p in
+    let p, cps_calls, global_info = Effects.f p variable_uses in
+    let p = Lambda_lifting.f p in
+    let p =
+      if Config.Flag.globaldeadcode ()
+        then Global_deadcode.f p ~deadcode_sentinal global_info
+        else p
+    in
+    p, cps_calls)
   else p, (Code.Var.Set.empty : Effects.cps_calls)
 
-let exact_calls profile p =
-  let deadcode_sentinal =
-    (* If deadcode is disabled, this field is just fresh variable *)
-    Code.Var.fresh ()
-  in
+let exact_calls profile p deadcode_sentinal =
   if not (Config.Flag.effects ())
   then
     let fast =
@@ -109,14 +111,13 @@ let exact_calls profile p =
       | O1 | O2 -> true
     in
     let info = Global_flow.f ~fast p in
-    let p =
+    let p = 
       if Config.Flag.globaldeadcode ()
-      then Global_deadcode.f p ~deadcode_sentinal info
-      else p
+        then Global_deadcode.f p ~deadcode_sentinal info 
+        else p 
     in
-    let p = Specialize.f ~function_arity:(fun f -> Global_flow.function_arity info f) p in
-    p, deadcode_sentinal
-  else p, deadcode_sentinal
+    Specialize.f ~function_arity:(fun f -> Global_flow.function_arity info f) p
+  else p
 
 let print p =
   if debug () then Code.Print.program (fun _ _ -> "") p;
@@ -583,14 +584,19 @@ let configure formatter =
 
 let full ~standalone ~wrap_with_fun ~profile ~linkall ~source_map formatter d p =
   let exported_runtime = not standalone in
-  let opt =
-    specialize_js_once
-    +> (match profile with
-       | O1 -> o1
-       | O2 -> o2
-       | O3 -> o3)
-    +> exact_calls profile
-    +> map_fst (effects +> map_fst (Generate_closure.f +> deadcode'))
+  let opt p =
+    let p = specialize_js_once p in 
+    let p = 
+      match profile with
+        | O1 -> o1 p
+        | O2 -> o2 p
+        | O3 -> o3 p
+    in
+    let deadcode_sentinal = Code.Var.fresh () in
+    let p = exact_calls profile p deadcode_sentinal in
+    let p, cps_calls = effects p deadcode_sentinal in
+    let p = Generate_closure.f p in
+    (deadcode' p, cps_calls), deadcode_sentinal
   in
   let emit =
     generate d ~exported_runtime ~wrap_with_fun ~warn_on_unhandled_effect:standalone
